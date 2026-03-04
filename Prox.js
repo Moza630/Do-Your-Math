@@ -1,9 +1,5 @@
 /**
- * ╔══════════════════════════════════════╗
- * ║        PROXY BROWSER v3.0            ║
- * ║  Strips X-Frame-Options/CSP on fly   ║
- * ╚══════════════════════════════════════╝
- *
+ * PROXY BROWSER v4.0 — full URL-rewriting proxy
  * node proxy-browser.js
  */
 
@@ -14,9 +10,123 @@ const { URL }   = require('url');
 
 const PROXY_PORT = 8765;
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  LOCAL PROXY SERVER
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+function proxyURL(target) {
+  return `http://127.0.0.1:${PROXY_PORT}/${encodeURIComponent(target)}`;
+}
+
+function errPage(msg) {
+  return `<html><body style="font-family:monospace;background:#0d0d12;color:#ff6b6b;padding:3rem">
+    <h2>⚠ Proxy Error</h2><p style="color:#888;margin-top:1rem">${msg}</p></body></html>`;
+}
+
+// Resolve a potentially-relative URL against a base, return absolute
+function resolveURL(href, base) {
+  try {
+    if (/^(https?:|\/\/)/i.test(href)) return href.startsWith('//')
+      ? 'https:' + href : href;
+    return new URL(href, base).href;
+  } catch { return null; }
+}
+
+// Rewrite every URL-bearing attribute and CSS url() in an HTML string
+// so they all route through our proxy
+function rewriteHTML(html, baseURL) {
+  // 1. Inject <base href> right after <head> so relative resources load correctly
+  //    (belt-and-suspenders alongside our attr rewriting)
+  html = html.replace(/<head([^>]*)>/i, `<head$1><base href="${baseURL}">`);
+
+  // 2. Rewrite src / href / action / srcset attributes
+  html = html.replace(
+    /((?:src|href|action)\s*=\s*)(["'])(.*?)\2/gi,
+    (match, attr, quote, val) => {
+      const trimmed = val.trim();
+      // Skip anchors, data URIs, javascript:, mailto:, blob:
+      if (!trimmed || /^(#|javascript:|mailto:|tel:|data:|blob:)/i.test(trimmed)) return match;
+      const abs = resolveURL(trimmed, baseURL);
+      if (!abs) return match;
+      return `${attr}${quote}${proxyURL(abs)}${quote}`;
+    }
+  );
+
+  // 3. Rewrite srcset (comma-separated URL [descriptor] pairs)
+  html = html.replace(
+    /srcset\s*=\s*(["'])(.*?)\1/gi,
+    (match, quote, val) => {
+      const rewritten = val.split(',').map(part => {
+        const [url, ...rest] = part.trim().split(/\s+/);
+        if (!url) return part;
+        const abs = resolveURL(url, baseURL);
+        return abs ? [proxyURL(abs), ...rest].join(' ') : part;
+      }).join(', ');
+      return `srcset=${quote}${rewritten}${quote}`;
+    }
+  );
+
+  // 4. Rewrite CSS url(...) inside <style> blocks
+  html = html.replace(
+    /(<style[^>]*>)([\s\S]*?)(<\/style>)/gi,
+    (m, open, css, close) => open + rewriteCSS(css, baseURL) + close
+  );
+
+  // 5. Inject navigation-intercept script just before </body>
+  //    Catches clicks on links the HTML rewriter may have missed
+  const interceptScript = `
+<script>
+(function(){
+  var PROXY = ${JSON.stringify(proxyURL('__PLACEHOLDER__').replace(encodeURIComponent('__PLACEHOLDER__'),''))};
+  function pw(u){ return PROXY + encodeURIComponent(u); }
+  function abs(u){
+    try{ return new URL(u, document.baseURI).href; }catch(e){ return null; }
+  }
+  document.addEventListener('click', function(e){
+    var a = e.target.closest('a');
+    if (!a) return;
+    var href = a.getAttribute('href');
+    if (!href || /^(#|javascript:|mailto:|tel:)/i.test(href)) return;
+    var resolved = abs(href);
+    if (!resolved) return;
+    // Already proxied?
+    if (resolved.startsWith(location.origin + '/')) return;
+    e.preventDefault();
+    // Tell the parent shell to navigate
+    try { window.top.postMessage({ type:'PROXY_NAV', url: resolved }, '*'); } catch(err){}
+  }, true);
+
+  // Intercept form submissions
+  document.addEventListener('submit', function(e){
+    var form = e.target;
+    var action = form.getAttribute('action');
+    if (!action) return;
+    var resolved = abs(action);
+    if (!resolved) return;
+    e.preventDefault();
+    var data = new URLSearchParams(new FormData(form)).toString();
+    var dest = resolved + (form.method.toLowerCase()==='get' ? '?' + data : '');
+    try { window.top.postMessage({ type:'PROXY_NAV', url: dest }, '*'); } catch(err){}
+  }, true);
+})();
+</script>`;
+
+  html = html.replace(/<\/body>/i, interceptScript + '</body>');
+  // If there's no </body> just append
+  if (!/<\/body>/i.test(html)) html += interceptScript;
+
+  return html;
+}
+
+function rewriteCSS(css, baseURL) {
+  return css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, quote, val) => {
+    const trimmed = val.trim();
+    if (!trimmed || /^(data:|#)/i.test(trimmed)) return match;
+    const abs = resolveURL(trimmed, baseURL);
+    return abs ? `url(${quote}${proxyURL(abs)}${quote})` : match;
+  });
+}
+
+// ─── proxy server ─────────────────────────────────────────────────────────────
+
 const proxyServer = http.createServer((req, res) => {
   let targetUrl;
   try {
@@ -27,7 +137,6 @@ const proxyServer = http.createServer((req, res) => {
     return res.end('Bad Request');
   }
 
-  // Browser-like headers — servers hang up without a real User-Agent
   const baseHeaders = {
     'accept':                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'accept-language':           'en-US,en;q=0.9',
@@ -54,7 +163,6 @@ const proxyServer = http.createServer((req, res) => {
     const lib  = parsed.protocol === 'https:' ? https : http;
     const port = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80);
     const path = (parsed.pathname || '/') + (parsed.search || '');
-    const hdrs = { ...baseHeaders, host: parsed.host };
 
     const proxyReq = lib.request(
       {
@@ -62,33 +170,48 @@ const proxyServer = http.createServer((req, res) => {
         port,
         path,
         method:             'GET',
-        headers:            hdrs,
-        rejectUnauthorized: false,  // skip SSL cert validation
+        headers:            { ...baseHeaders, host: parsed.host },
+        rejectUnauthorized: false,
         timeout:            20000,
       },
       (proxyRes) => {
         const status = proxyRes.statusCode;
 
-        // Transparently follow redirects
-        if ([301, 302, 303, 307, 308].includes(status) && proxyRes.headers['location']) {
+        if ([301,302,303,307,308].includes(status) && proxyRes.headers['location']) {
           const loc  = proxyRes.headers['location'];
           const next = loc.startsWith('http') ? loc : new URL(loc, url).href;
           proxyRes.resume();
           return doRequest(next, hops + 1);
         }
 
-        // Strip every header that blocks iframe embedding
+        // Strip iframe-blocking headers
         const out = { ...proxyRes.headers };
-        delete out['x-frame-options'];
-        delete out['content-security-policy'];
-        delete out['content-security-policy-report-only'];
-        delete out['cross-origin-opener-policy'];
-        delete out['cross-origin-embedder-policy'];
-        delete out['cross-origin-resource-policy'];
+        ['x-frame-options','content-security-policy','content-security-policy-report-only',
+         'cross-origin-opener-policy','cross-origin-embedder-policy','cross-origin-resource-policy'
+        ].forEach(h => delete out[h]);
         out['access-control-allow-origin'] = '*';
 
-        res.writeHead(status, out);
-        proxyRes.pipe(res, { end: true });
+        const ct = (out['content-type'] || '').toLowerCase();
+        const isHTML = ct.includes('text/html');
+        const isCSS  = ct.includes('text/css');
+
+        if (isHTML || isCSS) {
+          // Buffer so we can rewrite URLs
+          delete out['content-length']; // length will change after rewriting
+          const chunks = [];
+          proxyRes.on('data', c => chunks.push(c));
+          proxyRes.on('end', () => {
+            let body = Buffer.concat(chunks).toString('utf8');
+            body = isHTML ? rewriteHTML(body, url) : rewriteCSS(body, url);
+            out['content-length'] = Buffer.byteLength(body).toString();
+            res.writeHead(status, out);
+            res.end(body);
+          });
+        } else {
+          // Binary / other — pipe straight through
+          res.writeHead(status, out);
+          proxyRes.pipe(res, { end: true });
+        }
       }
     );
 
@@ -105,19 +228,13 @@ const proxyServer = http.createServer((req, res) => {
   doRequest(targetUrl, 0);
 });
 
-function errPage(msg) {
-  return `<html><body style="font-family:monospace;background:#0d0d12;color:#ff6b6b;padding:3rem">
-    <h2>⚠ Proxy Error</h2><p style="color:#888;margin-top:1rem">${msg}</p></body></html>`;
-}
-
 proxyServer.listen(PROXY_PORT, '127.0.0.1', () => {
   console.log(`\n✓ Proxy server live → http://127.0.0.1:${PROXY_PORT}\n`);
   launchBrowser();
 });
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  PUPPETEER SHELL
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── puppeteer shell ──────────────────────────────────────────────────────────
+
 async function launchBrowser() {
   const browser = await puppeteer.launch({
     headless: false,
@@ -133,24 +250,26 @@ async function launchBrowser() {
   await page.goto('about:blank');
 
   await page.evaluate((PROXY_PORT) => {
-    const proxyURL = (target) =>
-      `http://127.0.0.1:${PROXY_PORT}/${encodeURIComponent(target)}`;
+    const PROXY_BASE = `http://127.0.0.1:${PROXY_PORT}/`;
+    const proxyURL   = (target) => PROXY_BASE + encodeURIComponent(target);
 
     let navHistory = [];
     let histIdx    = -1;
 
+    // ── Fonts ──────────────────────────────────────────────────────────────
     const fontLink = document.createElement('link');
     fontLink.rel   = 'stylesheet';
     fontLink.href  = 'https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&display=swap';
     document.head.appendChild(fontLink);
 
+    // ── Styles ─────────────────────────────────────────────────────────────
     const style = document.createElement('style');
     style.textContent = `
       *, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
       :root {
-        --bg:      #0d0d12; --surface: #17171f; --border: #2a2a38;
-        --accent:  #7c6af7; --accent2: #f7826a;
-        --text:    #e8e6f0; --muted:   #6b6880; --bar-h:  56px;
+        --bg:#0d0d12; --surface:#17171f; --border:#2a2a38;
+        --accent:#7c6af7; --accent2:#f7826a;
+        --text:#e8e6f0; --muted:#6b6880; --bar-h:56px;
       }
       html,body { width:100%; height:100%; overflow:hidden; background:var(--bg); }
       #chrome {
@@ -162,49 +281,47 @@ async function launchBrowser() {
       .dots { display:flex; gap:6px; flex-shrink:0; }
       .dot  { width:12px; height:12px; border-radius:50%; cursor:pointer; transition:filter .15s; }
       .dot:hover { filter:brightness(1.4); }
-      .dot.red { background:#ff5f57; } .dot.yel { background:#febc2e; } .dot.grn { background:#28c840; }
+      .dot.red{background:#ff5f57} .dot.yel{background:#febc2e} .dot.grn{background:#28c840}
       .nav-btn {
         width:32px; height:32px; border-radius:8px; border:none;
         background:transparent; color:var(--muted); cursor:pointer;
         display:flex; align-items:center; justify-content:center;
-        font-size:16px; transition:background .15s, color .15s; flex-shrink:0;
+        font-size:16px; transition:background .15s,color .15s; flex-shrink:0;
       }
-      .nav-btn:hover:not(:disabled) { background:var(--border); color:var(--text); }
-      .nav-btn:disabled { opacity:.3; cursor:default; }
+      .nav-btn:hover:not(:disabled){background:var(--border);color:var(--text)}
+      .nav-btn:disabled{opacity:.3;cursor:default}
       #addr-wrap {
         flex:1; display:flex; align-items:center;
         background:var(--bg); border:1px solid var(--border);
         border-radius:10px; height:36px; overflow:hidden;
-        transition:border-color .2s, box-shadow .2s;
+        transition:border-color .2s,box-shadow .2s;
       }
-      #addr-wrap:focus-within { border-color:var(--accent); box-shadow:0 0 0 3px rgba(124,106,247,.18); }
-      #favicon { width:18px; height:18px; margin:0 8px; flex-shrink:0; object-fit:contain; opacity:0; transition:opacity .2s; }
+      #addr-wrap:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,106,247,.18)}
+      #favicon{width:18px;height:18px;margin:0 8px;flex-shrink:0;object-fit:contain;opacity:0;transition:opacity .2s}
       #addr {
         flex:1; background:transparent; border:none; outline:none;
         color:var(--text); font-family:'DM Mono',monospace; font-size:13px; padding-right:10px;
       }
-      #addr::selection { background:rgba(124,106,247,.35); }
+      #addr::selection{background:rgba(124,106,247,.35)}
       #load-bar {
         position:fixed; top:var(--bar-h); left:0; height:2px;
-        background:linear-gradient(90deg, var(--accent), var(--accent2));
+        background:linear-gradient(90deg,var(--accent),var(--accent2));
         width:0%; z-index:2147483646; opacity:0; transition:opacity .4s;
       }
-      #load-bar.loading { opacity:1; animation:indeterminate 1.4s ease infinite; }
-      @keyframes indeterminate {
-        0%  { width:0%;  margin-left:0; }
-        50% { width:60%; margin-left:20%; }
-        100%{ width:10%; margin-left:100%; }
+      #load-bar.loading{opacity:1;animation:indet 1.4s ease infinite}
+      @keyframes indet{
+        0%{width:0%;margin-left:0} 50%{width:60%;margin-left:20%} 100%{width:10%;margin-left:100%}
       }
-      #load-bar.done { width:100%; opacity:0; }
+      #load-bar.done{width:100%;opacity:0}
       #status-badge {
         font-family:'DM Mono',monospace; font-size:11px; color:var(--muted);
         padding:4px 10px; border-radius:6px; background:var(--bg);
         border:1px solid var(--border); white-space:nowrap; flex-shrink:0;
         min-width:70px; text-align:center; transition:color .3s;
       }
-      #status-badge.ok   { color:#28c840; border-color:rgba(40,200,64,.3); }
-      #status-badge.err  { color:#ff5f57; border-color:rgba(255,95,87,.3); }
-      #status-badge.load { color:var(--accent); border-color:rgba(124,106,247,.3); }
+      #status-badge.ok  {color:#28c840;border-color:rgba(40,200,64,.3)}
+      #status-badge.err {color:#ff5f57;border-color:rgba(255,95,87,.3)}
+      #status-badge.load{color:var(--accent);border-color:rgba(124,106,247,.3)}
       #viewer {
         position:fixed; top:var(--bar-h); left:0;
         width:100vw; height:calc(100vh - var(--bar-h));
@@ -218,27 +335,27 @@ async function launchBrowser() {
       }
       #start h1 {
         font-family:'Syne',sans-serif; font-size:48px; font-weight:800;
-        background:linear-gradient(135deg, var(--accent), var(--accent2));
+        background:linear-gradient(135deg,var(--accent),var(--accent2));
         -webkit-background-clip:text; -webkit-text-fill-color:transparent; letter-spacing:-1px;
       }
-      #start p { color:var(--muted); font-family:'DM Mono',monospace; font-size:13px; }
-      .quick-links { display:flex; gap:12px; flex-wrap:wrap; justify-content:center; margin-top:8px; }
+      #start p{color:var(--muted);font-family:'DM Mono',monospace;font-size:13px}
+      .quick-links{display:flex;gap:12px;flex-wrap:wrap;justify-content:center;margin-top:8px}
       .ql {
         padding:8px 16px; border-radius:8px; border:1px solid var(--border);
         background:var(--surface); color:var(--text); cursor:pointer;
         font-family:'DM Mono',monospace; font-size:12px;
-        transition:border-color .2s, background .2s; text-decoration:none;
+        transition:border-color .2s,background .2s; text-decoration:none;
       }
-      .ql:hover { border-color:var(--accent); background:rgba(124,106,247,.08); }
+      .ql:hover{border-color:var(--accent);background:rgba(124,106,247,.08)}
       #err-overlay {
         display:none; position:fixed; top:var(--bar-h); left:0;
         width:100vw; height:calc(100vh - var(--bar-h));
         background:var(--bg); z-index:99;
         align-items:center; justify-content:center; flex-direction:column; gap:12px;
       }
-      #err-overlay.show { display:flex; }
-      #err-overlay h2 { font-family:'Syne',sans-serif; color:#ff5f57; font-size:28px; }
-      #err-overlay p  { font-family:'DM Mono',monospace; color:var(--muted); font-size:13px; max-width:420px; text-align:center; }
+      #err-overlay.show{display:flex}
+      #err-overlay h2{font-family:'Syne',sans-serif;color:#ff5f57;font-size:28px}
+      #err-overlay p{font-family:'DM Mono',monospace;color:var(--muted);font-size:13px;max-width:420px;text-align:center}
     `;
     document.head.appendChild(style);
 
@@ -246,7 +363,7 @@ async function launchBrowser() {
       <div id="load-bar"></div>
       <div id="chrome">
         <div class="dots">
-          <div class="dot red" title="Close" onclick="window.close()"></div>
+          <div class="dot red" onclick="window.close()"></div>
           <div class="dot yel"></div>
           <div class="dot grn"></div>
         </div>
@@ -259,7 +376,7 @@ async function launchBrowser() {
         </div>
         <div id="status-badge">ready</div>
       </div>
-      <iframe id="viewer" style="opacity:0"></iframe>
+      <iframe id="viewer" style="opacity:0" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-top-navigation-by-user-activation"></iframe>
       <div id="start">
         <h1>Proxy Browser</h1>
         <p>All sites load — X-Frame-Options & CSP stripped at proxy level</p>
@@ -328,6 +445,13 @@ async function launchBrowser() {
 
       frame.src = proxyURL(target);
     }
+
+    // Listen for in-page navigation messages from the injected intercept script
+    window.addEventListener('message', (e) => {
+      if (e.data && e.data.type === 'PROXY_NAV') {
+        navigate(e.data.url);
+      }
+    });
 
     frame.addEventListener('load', () => {
       loadBar.className = 'done';
